@@ -1,0 +1,5 @@
+[workspace]
+# Keep changelog + version bump automation enabled for release PRs.
+changelog_update = true
+dependencies_update = true
+

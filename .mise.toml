@@ -1,0 +1,50 @@
+[tools]
+rust = "stable"
+
+[tasks.fmt]
+description = "Format Rust code"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.clippy]
+description = "Run clippy with warnings as errors"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Run tests"
+run = "cargo test --all-targets"
+
+[tasks.build]
+description = "Build debug binary"
+run = "cargo build"
+
+[tasks.build-release]
+description = "Build release binary"
+run = "cargo build --release"
+
+[tasks.install-local]
+description = "Install pj into ~/.local/bin"
+run = "cargo install --path . --root ~/.local --force"
+
+[tasks.release-pr]
+description = "Create/update release PR with release-plz"
+run = "release-plz release-pr"
+
+[tasks.release]
+description = "Publish release with release-plz"
+run = "release-plz release"
+
+[tasks.run]
+description = "Run pj TUI"
+run = "cargo run --"
+
+[tasks.doctor]
+description = "Run pj doctor in JSON mode"
+run = "cargo run -- doctor --json"
+
+[tasks.check]
+description = "Run fmt-check + clippy + test"
+run = "mise run fmt-check && mise run clippy && mise run test"
