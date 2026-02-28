@@ -8,7 +8,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use regex::Regex;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -311,19 +311,84 @@ struct App {
     message: String,
     report: Option<DoctorReport>,
     pending_confirm: Option<usize>,
+    events: VecDeque<String>,
+    event_stream: EventStreamConfig,
+    event_max_chars: usize,
     should_quit: bool,
+}
+
+#[derive(Debug, Clone)]
+enum EventStreamConfig {
+    Off,
+    App,
+    File(PathBuf),
+    Static(String),
 }
 
 impl App {
     fn new() -> Self {
-        Self {
+        let event_stream = parse_event_stream_config();
+        let event_max_chars = std::env::var("PJ_TUI_EVENT_MAX_CHARS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(140);
+        let mut app = Self {
             menu_index: 0,
             message: "Press Enter to run an action. q to quit.".to_string(),
             report: None,
             pending_confirm: None,
+            events: VecDeque::new(),
+            event_stream,
+            event_max_chars,
             should_quit: false,
+        };
+        app.push_event("tui started".to_string());
+        app
+    }
+
+    fn push_event(&mut self, event: String) {
+        let event = event.trim();
+        if event.is_empty() {
+            return;
+        }
+        let ts = now_hms();
+        self.events.push_front(format!("[{ts}] {event}"));
+        while self.events.len() > 32 {
+            self.events.pop_back();
         }
     }
+
+    fn event_line(&self) -> String {
+        let line = match &self.event_stream {
+            EventStreamConfig::Off => "events: off".to_string(),
+            EventStreamConfig::App => self
+                .events
+                .front()
+                .cloned()
+                .unwrap_or_else(|| "events: no activity yet".to_string()),
+            EventStreamConfig::File(path) => read_last_nonempty_line(path)
+                .map(|v| format!("file:{} | {}", path.display(), v))
+                .unwrap_or_else(|| format!("file:{} | (missing/empty)", path.display())),
+            EventStreamConfig::Static(text) => text.clone(),
+        };
+        truncate_single_line(&line, self.event_max_chars)
+    }
+}
+
+fn parse_event_stream_config() -> EventStreamConfig {
+    let raw = std::env::var("PJ_TUI_EVENT_STREAM").unwrap_or_else(|_| "app".to_string());
+    let v = raw.trim();
+    if v.eq_ignore_ascii_case("off") {
+        return EventStreamConfig::Off;
+    }
+    if v.eq_ignore_ascii_case("app") || v.is_empty() {
+        return EventStreamConfig::App;
+    }
+    if let Some(path) = v.strip_prefix("file:") {
+        return EventStreamConfig::File(PathBuf::from(path));
+    }
+    EventStreamConfig::Static(v.to_string())
 }
 
 fn main() {
@@ -1210,7 +1275,7 @@ struct SecretPattern {
 fn secret_patterns() -> &'static Vec<SecretPattern> {
     static PATTERNS: OnceLock<Vec<SecretPattern>> = OnceLock::new();
     PATTERNS.get_or_init(|| {
-        let defs: [(&str, &str); 15] = [
+        let defs: [(&str, &str); 13] = [
             (r"\b(?:A3T[A-Z0-9]|AKIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|ANVA|APKA|AROA|ASCA|ASIA)[A-Z0-9]{16}\b", "AWS-KEY"),
             (r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b", "GITHUB-TOKEN"),
             (r"\bgithub_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}\b", "GITHUB-TOKEN"),
@@ -1224,11 +1289,6 @@ fn secret_patterns() -> &'static Vec<SecretPattern> {
             (r"mongodb(?:\+srv)?://[^:\s]+:[^@\s]+@[^/\s]+", "DB-MONGODB"),
             (r"redis://[^:\s]+:[^@\s]+@[^/\s]+", "DB-REDIS"),
             (r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----", "PRIVATE-KEY"),
-            (
-                r#"\b(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|GH_TOKEN)\s*=\s*['"]?[^\s'"`]+"#,
-                "ENV-SECRET",
-            ),
-            (r#"(?:password|passwd|pwd|secret_key|auth_key|private_key|encryption_key|token|api[_-]?key)\s*[=:]\s*["']?[^\s"']{8,}["']?"#, "SECRET"),
         ];
 
         defs.iter()
@@ -1250,15 +1310,178 @@ fn redact_text(input: &str) -> String {
 }
 
 fn scan_text_for_secrets(input: &str) -> Vec<String> {
-    let mut findings = Vec::new();
-    for p in secret_patterns() {
-        if p.re.is_match(input) {
-            findings.push(p.label.to_string());
+    let mut findings: HashSet<String> = HashSet::new();
+    let scan_lines = extract_scan_lines(input);
+
+    for line in &scan_lines {
+        for p in secret_patterns() {
+            if p.re.is_match(line) {
+                findings.insert(p.label.to_string());
+            }
         }
     }
-    findings.sort();
-    findings.dedup();
-    findings
+
+    if scan_lines
+        .iter()
+        .any(|line| line_has_sensitive_assignment(line))
+    {
+        findings.insert("ENV-SECRET".to_string());
+    }
+
+    let mut out: Vec<String> = findings.into_iter().collect();
+    out.sort();
+    out
+}
+
+fn extract_scan_lines(input: &str) -> Vec<String> {
+    let is_diff = input.lines().any(|l| l.starts_with("diff --git "));
+    if !is_diff {
+        return input
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+    }
+
+    input
+        .lines()
+        .filter_map(|raw| {
+            if !raw.starts_with('+') || raw.starts_with("+++") {
+                return None;
+            }
+            let line = raw[1..].trim_end();
+            if line.trim().is_empty() {
+                return None;
+            }
+            Some(line.to_string())
+        })
+        .collect()
+}
+
+fn line_has_sensitive_assignment(line: &str) -> bool {
+    // Ignore lines that are likely rule/regex definitions or docs examples.
+    let l = line.trim();
+    if l.contains("Regex::new")
+        || l.contains("\\b")
+        || l.contains("token=")
+        || l.contains("api[_-]?key")
+        || l.starts_with('#')
+        || l.starts_with("//")
+        || l.starts_with('*')
+        || l.starts_with('-')
+    {
+        return false;
+    }
+
+    static ENV_ASSIGN_RE: OnceLock<Regex> = OnceLock::new();
+    let re = ENV_ASSIGN_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)^(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*=\s*["']?([^"'#\s]+)["']?(?:\s+#.*)?$"#,
+        )
+        .expect("valid env assign regex")
+    });
+
+    let Some(caps) = re.captures(l) else {
+        return false;
+    };
+    let key = caps
+        .get(1)
+        .map(|m| m.as_str())
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let value = caps.get(2).map(|m| m.as_str()).unwrap_or_default().trim();
+
+    if value.is_empty() || looks_like_placeholder(value) {
+        return false;
+    }
+    if !is_sensitive_key(&key) {
+        return false;
+    }
+    value_looks_secret(value)
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    const EXPLICIT: [&str; 12] = [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "DATABASE_URL",
+        "REDIS_URL",
+        "PASSWORD",
+        "PASSWD",
+        "SECRET_KEY",
+        "PRIVATE_KEY",
+    ];
+    if EXPLICIT.contains(&key) {
+        return true;
+    }
+    // Avoid noisy false positives such as *_STREAM, *_MAX_CHARS, etc.
+    let deny_suffix = ["_STREAM", "_MAX", "_MAX_CHARS", "_LEVEL", "_FORMAT"];
+    if deny_suffix.iter().any(|s| key.ends_with(s)) {
+        return false;
+    }
+    key.contains("TOKEN")
+        || key.contains("SECRET")
+        || key.contains("PASSWORD")
+        || key.contains("PASSWD")
+        || key.contains("PRIVATE_KEY")
+        || key.contains("API_KEY")
+}
+
+fn looks_like_placeholder(value: &str) -> bool {
+    let v = value
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_ascii_lowercase();
+    let placeholders = [
+        "replace-me",
+        "changeme",
+        "change-me",
+        "example",
+        "example-value",
+        "dummy",
+        "sample",
+        "placeholder",
+        "redacted",
+        "unset",
+        "none",
+        "null",
+        "true",
+        "false",
+        "app",
+    ];
+    if placeholders.iter().any(|p| v == *p) {
+        return true;
+    }
+    v.starts_with("${")
+        || v.starts_with('$')
+        || v.starts_with('<')
+        || v.starts_with("your_")
+        || v.starts_with("your-")
+}
+
+fn value_looks_secret(value: &str) -> bool {
+    let v = value.trim_matches('"').trim_matches('\'');
+    if v.len() < 10 {
+        return false;
+    }
+    let mut classes = 0;
+    if v.chars().any(|c| c.is_ascii_lowercase()) {
+        classes += 1;
+    }
+    if v.chars().any(|c| c.is_ascii_uppercase()) {
+        classes += 1;
+    }
+    if v.chars().any(|c| c.is_ascii_digit()) {
+        classes += 1;
+    }
+    if v.chars().any(|c| !c.is_ascii_alphanumeric()) {
+        classes += 1;
+    }
+    classes >= 2
 }
 
 fn run_secret(args: SecretArgs) -> Result<(), String> {
@@ -1902,17 +2125,33 @@ fn run_tui_loop(
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(3),
-                        Constraint::Length(18),
+                        Constraint::Length(1),
                         Constraint::Min(8),
+                        Constraint::Length(3),
                     ])
                     .split(f.area());
 
-                let title = Paragraph::new(
-                    "pj - portable bootstrap dashboard  |  arrows: move  enter: select  q: quit",
-                )
-                .block(Block::default().borders(Borders::ALL).title("pj"));
+                let cwd = std::env::current_dir()
+                    .ok()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let title_text = format!(
+                    " pj v{} | cwd:{} | arrows:move enter:select q:quit ",
+                    VERSION,
+                    truncate_single_line(&cwd, 56)
+                );
+                let title = Paragraph::new(title_text).style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                );
                 f.render_widget(title, chunks[0]);
+
+                let middle = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Ratio(1, 6), Constraint::Ratio(5, 6)])
+                    .split(chunks[1]);
 
                 let items: Vec<ListItem> = menu.iter().map(|m| ListItem::new(*m)).collect();
                 let list = List::new(items)
@@ -1923,10 +2162,9 @@ fn run_tui_loop(
                             .add_modifier(Modifier::BOLD),
                     )
                     .highlight_symbol("➜ ");
-
                 let mut state = ratatui::widgets::ListState::default();
                 state.select(Some(app.menu_index));
-                f.render_stateful_widget(list, chunks[1], &mut state);
+                f.render_stateful_widget(list, middle[0], &mut state);
 
                 let mut lines = vec![Line::from(app.message.clone())];
                 if let Some(report) = &app.report {
@@ -1949,7 +2187,44 @@ fn run_tui_loop(
                 let details = Paragraph::new(lines)
                     .block(Block::default().borders(Borders::ALL).title("Status"))
                     .wrap(Wrap { trim: true });
-                f.render_widget(details, chunks[2]);
+                f.render_widget(details, middle[1]);
+
+                let statusline = format!(
+                    " NORMAL | action:{} | pending:{} | events:{} ",
+                    menu[app.menu_index],
+                    if app.pending_confirm.is_some() {
+                        "confirm"
+                    } else {
+                        "none"
+                    },
+                    app.events.len()
+                );
+                let status_widget = Paragraph::new(statusline).style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                );
+                f.render_widget(
+                    status_widget,
+                    Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, 1),
+                );
+
+                let event_widget = Paragraph::new(format!(" EVENT | {}", app.event_line()))
+                    .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+                f.render_widget(
+                    event_widget,
+                    Rect::new(chunks[2].x, chunks[2].y + 1, chunks[2].width, 1),
+                );
+
+                let hint_widget = Paragraph::new(
+                    " :sync=Sync Full  :dotup=Dot Up  :doctor=Doctor  :ctx=Context ",
+                )
+                .style(Style::default().fg(Color::Gray).bg(Color::Black));
+                f.render_widget(
+                    hint_widget,
+                    Rect::new(chunks[2].x, chunks[2].y + 2, chunks[2].width, 1),
+                );
             })
             .map_err(|e| e.to_string())?;
 
@@ -1959,6 +2234,8 @@ fn run_tui_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+
+            let prev_message = app.message.clone();
 
             match key.code {
                 KeyCode::Char('q') => app.should_quit = true,
@@ -2164,6 +2441,10 @@ fn run_tui_loop(
                 },
                 _ => {}
             }
+
+            if app.message != prev_message {
+                app.push_event(app.message.clone());
+            }
         }
     }
 
@@ -2299,6 +2580,63 @@ fn truncate_for_tui(s: &str, max_chars: usize) -> String {
     }
     let out: String = trimmed.chars().take(max_chars).collect();
     format!("{out}\n... (truncated)")
+}
+
+fn truncate_single_line(s: &str, max_chars: usize) -> String {
+    let one_line = s.replace('\n', " ");
+    let trimmed = one_line.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let out: String = trimmed.chars().take(max_chars).collect();
+    format!("{out}...")
+}
+
+fn read_last_nonempty_line(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.to_string())
+}
+
+fn now_hms() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let day = secs % 86_400;
+    let h = day / 3_600;
+    let m = (day % 3_600) / 60;
+    let s = day % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_sensitive_env_assignments() {
+        assert!(line_has_sensitive_assignment(
+            r#"GITHUB_TOKEN="ghp_abcdefghijklmnopqrstuvwxyz1234567890""#
+        ));
+        assert!(line_has_sensitive_assignment(
+            r#"AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#
+        ));
+    }
+
+    #[test]
+    fn ignores_non_secret_event_vars() {
+        assert!(!line_has_sensitive_assignment(
+            r#"PJ_TUI_EVENT_STREAM="app""#
+        ));
+        assert!(!line_has_sensitive_assignment(
+            r#"PJ_TUI_EVENT_MAX_CHARS="140""#
+        ));
+    }
 }
 
 fn run_cmd_in_dir(dir: &Path, bin: &str, args: &[&str]) -> Result<(), String> {
