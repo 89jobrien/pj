@@ -65,6 +65,24 @@ struct DotArgs {
 
 #[derive(Subcommand, Debug)]
 enum DotCommand {
+    /// Print resolved dotfiles directory
+    Where,
+    /// Show dotfiles git status (short)
+    RepoStatus,
+    /// Show dotfiles git diff
+    RepoDiff,
+    /// Show recent dotfiles commits
+    RepoLog,
+    /// Pull latest dotfiles changes
+    Pull,
+    /// Push current dotfiles branch
+    Push,
+    /// List available task runners and tasks
+    Tasks,
+    /// Detect stow/chezmoi capabilities and print dotfiles environment info
+    Info,
+    /// Apply dotfiles with detected manager (chezmoi or stow)
+    Apply,
     Install,
     Doctor,
     Up,
@@ -73,6 +91,8 @@ enum DotCommand {
     ObserveK8s,
     ObserveLogs,
     Status,
+    /// Run dotfiles container status task
+    ContainerStatus,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -218,7 +238,24 @@ fn run_up() -> Result<(), String> {
 }
 
 fn run_dot(args: DotArgs) -> Result<(), String> {
+    ensure_dotfiles_dir()?;
     match args.command {
+        DotCommand::Info => run_dot_info(),
+        DotCommand::Apply => run_dot_apply(),
+        DotCommand::Where => {
+            println!("{}", dotfiles_dir().display());
+            Ok(())
+        }
+        DotCommand::RepoStatus => run_cmd_in_dir(&dotfiles_dir(), "git", &["status", "-sb"]),
+        DotCommand::RepoDiff => run_cmd_in_dir(&dotfiles_dir(), "git", &["diff"]),
+        DotCommand::RepoLog => run_cmd_in_dir(
+            &dotfiles_dir(),
+            "git",
+            &["log", "--oneline", "--decorate", "-n", "20"],
+        ),
+        DotCommand::Pull => run_cmd_in_dir(&dotfiles_dir(), "git", &["pull", "--ff-only"]),
+        DotCommand::Push => run_cmd_in_dir(&dotfiles_dir(), "git", &["push"]),
+        DotCommand::Tasks => run_dot_tasks_list(),
         DotCommand::Install => run_dot_task("install"),
         DotCommand::Doctor => run_dot_task("doctor"),
         DotCommand::Up => run_dot_task("up"),
@@ -226,7 +263,152 @@ fn run_dot(args: DotArgs) -> Result<(), String> {
         DotCommand::Observe => run_dot_task("observe"),
         DotCommand::ObserveK8s => run_dot_task("observe-k8s"),
         DotCommand::ObserveLogs => run_dot_task("observe-logs"),
-        DotCommand::Status => run_dot_task("container-status"),
+        DotCommand::Status => run_dot_info(),
+        DotCommand::ContainerStatus => run_dot_task("container-status"),
+    }
+}
+
+fn run_dot_tasks_list() -> Result<(), String> {
+    let dot = dotfiles_dir();
+    ensure_dotfiles_dir()?;
+
+    println!("dotfiles dir: {}", dot.display());
+    println!();
+
+    if which("mise").is_some() {
+        println!("== mise tasks ==");
+        run_cmd_in_dir(&dot, "mise", &["tasks", "ls"])?;
+        println!();
+    }
+    if which("just").is_some() {
+        println!("== just recipes ==");
+        run_cmd_in_dir(&dot, "just", &["--list"])?;
+        println!();
+    }
+    if which("make").is_some() {
+        println!("== make targets ==");
+        if which("rg").is_some() {
+            run_cmd_in_dir(&dot, "rg", &["-n", "^([a-zA-Z0-9_-]+):", "Makefile"])?;
+        } else {
+            println!("rg not found; skipping make target scan");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DotManager {
+    Chezmoi,
+    Stow,
+    Unknown,
+}
+
+fn detect_dot_manager(dot: &Path) -> DotManager {
+    let has_chezmoi_files = dot.join(".chezmoi.toml").is_file()
+        || dot.join(".chezmoi.toml.tmpl").is_file()
+        || dot.join(".chezmoiroot").is_file()
+        || dot.join(".chezmoiignore").is_file();
+    let has_stow_layout = dot.join("config").join("stow-packages.txt").is_file();
+
+    if has_chezmoi_files && which("chezmoi").is_some() {
+        return DotManager::Chezmoi;
+    }
+    if has_stow_layout && which("stow").is_some() {
+        return DotManager::Stow;
+    }
+    if has_chezmoi_files {
+        return DotManager::Chezmoi;
+    }
+    if has_stow_layout {
+        return DotManager::Stow;
+    }
+    DotManager::Unknown
+}
+
+fn run_dot_info() -> Result<(), String> {
+    let dot = dotfiles_dir();
+    ensure_dotfiles_dir()?;
+
+    println!("dotfiles dir: {}", dot.display());
+    println!("task runners:");
+    println!(
+        "  mise: {}",
+        if which("mise").is_some() { "yes" } else { "no" }
+    );
+    println!(
+        "  just: {}",
+        if which("just").is_some() { "yes" } else { "no" }
+    );
+    println!(
+        "  make: {}",
+        if which("make").is_some() { "yes" } else { "no" }
+    );
+    println!("dotfiles managers:");
+    println!(
+        "  stow command: {}",
+        if which("stow").is_some() { "yes" } else { "no" }
+    );
+    println!(
+        "  chezmoi command: {}",
+        if which("chezmoi").is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+
+    let manager = detect_dot_manager(&dot);
+    println!(
+        "detected manager: {}",
+        match manager {
+            DotManager::Chezmoi => "chezmoi",
+            DotManager::Stow => "stow",
+            DotManager::Unknown => "unknown",
+        }
+    );
+
+    run_cmd_in_dir(&dot, "git", &["status", "-sb"])
+}
+
+fn run_dot_apply() -> Result<(), String> {
+    let dot = dotfiles_dir();
+    ensure_dotfiles_dir()?;
+
+    match detect_dot_manager(&dot) {
+        DotManager::Chezmoi => {
+            if which("chezmoi").is_none() {
+                return Err("chezmoi layout detected but `chezmoi` command not found".to_string());
+            }
+            run_cmd(
+                "chezmoi",
+                &["apply", "--source", &dot.display().to_string()],
+            )
+        }
+        DotManager::Stow => {
+            if which("stow").is_none() {
+                return Err("stow layout detected but `stow` command not found".to_string());
+            }
+            if dot.join("install.sh").is_file() {
+                run_cmd_in_dir(&dot, "./install.sh", &[])
+            } else {
+                Err("stow layout detected but install.sh missing".to_string())
+            }
+        }
+        DotManager::Unknown => {
+            Err("no stow/chezmoi layout detected in dotfiles repository".to_string())
+        }
+    }
+}
+
+fn ensure_dotfiles_dir() -> Result<(), String> {
+    let dot = dotfiles_dir();
+    if dot.is_dir() {
+        Ok(())
+    } else {
+        Err(format!(
+            "dotfiles directory not found: {} (set PJ_DOTFILES_DIR)",
+            dot.display()
+        ))
     }
 }
 
@@ -346,7 +528,7 @@ fn run_tui_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
 ) -> Result<(), String> {
-    let menu = ["Doctor", "Dot Up", "Dot Doctor", "Quit"];
+    let menu = ["Doctor", "Dot Up", "Dot Doctor", "Dot Info", "Quit"];
 
     while !app.should_quit {
         terminal
@@ -444,7 +626,10 @@ fn run_tui_loop(
                     2 => {
                         app.message = "Run `pj dot doctor` in a normal shell.".to_string();
                     }
-                    3 => app.should_quit = true,
+                    3 => {
+                        app.message = "Run `pj dot info` in a normal shell.".to_string();
+                    }
+                    4 => app.should_quit = true,
                     _ => {}
                 },
                 _ => {}
