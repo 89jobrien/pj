@@ -32,6 +32,64 @@ pj tui
 - `sync`: one-shot update path: `pj update --pull` + `pj dot install` + final dotfiles task (`up` by default, or `doctor` with `--doctor-only`).
 - `tui`: ratatui dashboard with maintenance actions.
 
+## Data Flow
+
+```mermaid
+flowchart LR
+    U[User or Agent] --> PJ[pj CLI / TUI]
+    PJ --> Ctx[pj ctx<br/>project + env detection]
+    PJ --> Dot[pj dot<br/>dotfiles control plane]
+    PJ --> Cache[pj cache<br/>artifact lifecycle]
+    PJ --> Secret[pj secret<br/>scan + redact + hooks]
+    Dot --> Mise[mise run tasks]
+    Dot --> Just[just recipes]
+    Dot --> Make[make targets]
+    Mise --> Env[mise env + tool shims]
+    Dot --> Install[~/dotfiles install.sh]
+    Install --> Stow[stow/chezmoi apply]
+    Secret --> Hooks[git hooks]
+```
+
+## Workflow Patterns
+
+### 1) Full Machine Sync
+
+```mermaid
+flowchart TD
+    A[pj sync] --> B[pj update --pull]
+    B --> C[pj dot install]
+    C --> D[mise run up]
+    D --> E[doctor + runtime + cluster ready]
+```
+
+Use when you want to fully refresh toolchain + dotfiles + local dev runtime.
+
+### 2) Daily Dev Loop
+
+```mermaid
+flowchart TD
+    A[pj ctx] --> B[pj tui]
+    B --> C[pj cache status]
+    C --> D[pj cache clean --promote-binaries --yes]
+    B --> E[pj dot doctor]
+    E --> F[pj dot up]
+```
+
+Use when iterating quickly and keeping local resources clean.
+
+### 3) Safe Commit Hygiene
+
+```mermaid
+flowchart TD
+    A[git add] --> B[pj secret scan --staged]
+    B -->|pass| C[git commit]
+    B -->|fail| D[pj secret redact]
+    D --> E[fix staged content]
+    E --> B
+```
+
+Use to keep secrets out of git history while preserving fast commit flow.
+
 ## Install / Update
 
 ```bash
@@ -113,6 +171,11 @@ Current `pj tui` actions include:
 - Dot Doctor
 - Dot Up (with in-TUI confirmation)
 - Sync Full (with in-TUI confirmation)
+
+Layout:
+- Row 1: title/info bar
+- Row 2: primary workspace (actions:left, details:right at 1:5 ratio)
+- Row 3: single-line vim-style statusline with inline recent event stream
 
 ## Versioning / Releases
 

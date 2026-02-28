@@ -2127,7 +2127,7 @@ fn run_tui_loop(
                     .constraints([
                         Constraint::Length(1),
                         Constraint::Min(8),
-                        Constraint::Length(3),
+                        Constraint::Length(1),
                     ])
                     .split(f.area());
 
@@ -2190,14 +2190,15 @@ fn run_tui_loop(
                 f.render_widget(details, middle[1]);
 
                 let statusline = format!(
-                    " NORMAL | action:{} | pending:{} | events:{} ",
+                    " NORMAL | action:{} | pending:{} | events:{} | {} ",
                     menu[app.menu_index],
                     if app.pending_confirm.is_some() {
                         "confirm"
                     } else {
                         "none"
                     },
-                    app.events.len()
+                    app.events.len(),
+                    app.event_line()
                 );
                 let status_widget = Paragraph::new(statusline).style(
                     Style::default()
@@ -2208,22 +2209,6 @@ fn run_tui_loop(
                 f.render_widget(
                     status_widget,
                     Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, 1),
-                );
-
-                let event_widget = Paragraph::new(format!(" EVENT | {}", app.event_line()))
-                    .style(Style::default().fg(Color::White).bg(Color::DarkGray));
-                f.render_widget(
-                    event_widget,
-                    Rect::new(chunks[2].x, chunks[2].y + 1, chunks[2].width, 1),
-                );
-
-                let hint_widget = Paragraph::new(
-                    " :sync=Sync Full  :dotup=Dot Up  :doctor=Doctor  :ctx=Context ",
-                )
-                .style(Style::default().fg(Color::Gray).bg(Color::Black));
-                f.render_widget(
-                    hint_widget,
-                    Rect::new(chunks[2].x, chunks[2].y + 2, chunks[2].width, 1),
                 );
             })
             .map_err(|e| e.to_string())?;
