@@ -21,12 +21,15 @@ pj doctor
 pj context
 pj ctx                 # alias for context
 pj up
+pj sync
+pj sync --doctor-only
 pj tui
 ```
 
 - `doctor`: checks core tooling (`git`, `gh`, `mise`, `uv`, `bun`, `docker`, `colima`, `kubectl`, `k3d`).
 - `context`: project/environment scan (project markers, env file presence, secret-var presence, config state).
 - `up`: brings up local stack (dotfiles task if available, otherwise fallback runtime flow).
+- `sync`: one-shot update path: `pj update --pull` + `pj dot install` + final dotfiles task (`up` by default, or `doctor` with `--doctor-only`).
 - `tui`: ratatui dashboard with maintenance actions.
 
 ## Install / Update
@@ -109,6 +112,7 @@ Current `pj tui` actions include:
 - Dot Tasks
 - Dot Doctor
 - Dot Up (with in-TUI confirmation)
+- Sync Full (with in-TUI confirmation)
 
 ## Versioning / Releases
 

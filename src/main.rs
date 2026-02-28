@@ -44,6 +44,8 @@ enum Commands {
     InstallLocal(InstallLocalArgs),
     /// Update pj from source and reinstall locally
     Update(UpdateArgs),
+    /// Sync pj + dotfiles + dev stack end-to-end
+    Sync(SyncArgs),
     /// Configure global git identity
     GitConfig(GitConfigArgs),
     /// Cache/build artifact inspection and cleanup
@@ -101,6 +103,16 @@ struct UpdateArgs {
     /// Install debug build instead of release
     #[arg(long)]
     debug: bool,
+}
+
+#[derive(Args, Debug)]
+struct SyncArgs {
+    /// Skip pulling latest pj source before reinstall
+    #[arg(long)]
+    no_pull: bool,
+    /// Run dotfiles doctor instead of full up task
+    #[arg(long)]
+    doctor_only: bool,
 }
 
 #[derive(Args, Debug)]
@@ -323,6 +335,7 @@ fn main() {
         Some(Commands::Up) => run_up(),
         Some(Commands::InstallLocal(args)) => run_install_local(args),
         Some(Commands::Update(args)) => run_update(args),
+        Some(Commands::Sync(args)) => run_sync(args),
         Some(Commands::GitConfig(args)) => run_git_config(args),
         Some(Commands::Cache(args)) => run_cache(args),
         Some(Commands::Secret(args)) => run_secret(args),
@@ -777,6 +790,30 @@ fn run_update(args: UpdateArgs) -> Result<(), String> {
         source: Some(source.display().to_string()),
         debug: args.debug,
     })
+}
+
+fn run_sync(args: SyncArgs) -> Result<(), String> {
+    let do_pull = !args.no_pull;
+    println!("pj sync");
+    println!(
+        "  step 1/3: update pj{}",
+        if do_pull { " (with pull)" } else { "" }
+    );
+    run_update(UpdateArgs {
+        source: None,
+        pull: do_pull,
+        debug: false,
+    })?;
+
+    println!("  step 2/3: install/apply dotfiles");
+    run_dot_install()?;
+
+    let final_task = if args.doctor_only { "doctor" } else { "up" };
+    println!("  step 3/3: dotfiles task `{final_task}`");
+    run_dot_task(final_task)?;
+
+    println!("sync complete");
+    Ok(())
 }
 
 fn path_precedence_index(bin_path: &Path) -> usize {
@@ -1855,6 +1892,7 @@ fn run_tui_loop(
         "Dot Tasks",
         "Dot Doctor",
         "Dot Up",
+        "Sync Full",
         "Quit",
     ];
 
@@ -1865,7 +1903,7 @@ fn run_tui_loop(
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(3),
-                        Constraint::Length(16),
+                        Constraint::Length(18),
                         Constraint::Min(8),
                     ])
                     .split(f.area());
@@ -2105,7 +2143,23 @@ fn run_tui_loop(
                             };
                         }
                     }
-                    12 => app.should_quit = true,
+                    12 => {
+                        app.report = None;
+                        if app.pending_confirm != Some(12) {
+                            app.pending_confirm = Some(12);
+                            app.message = "Confirm Sync Full: press Enter again to run update + dot install + up. Use arrows to cancel.".to_string();
+                        } else {
+                            app.pending_confirm = None;
+                            app.message = match run_sync(SyncArgs {
+                                no_pull: false,
+                                doctor_only: false,
+                            }) {
+                                Ok(_) => "Sync complete.".to_string(),
+                                Err(e) => format!("Sync failed: {e}"),
+                            };
+                        }
+                    }
+                    13 => app.should_quit = true,
                     _ => {}
                 },
                 _ => {}

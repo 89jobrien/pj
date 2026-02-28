@@ -29,6 +29,10 @@ run = "cargo build --release"
 description = "Install pj into ~/.local/bin"
 run = "cargo install --path . --root ~/.local --force"
 
+[tasks.sync]
+description = "Run full pj sync flow"
+run = "cargo run -- sync"
+
 [tasks.release-pr]
 description = "Create/update release PR with release-plz"
 run = "release-plz release-pr"
